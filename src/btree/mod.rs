@@ -17,7 +17,7 @@ use crate::{
 };
 pub use iter::{BTreeIterator, LastIndex, LastKey};
 use node::SeparatorInner;
-use parking_lot::RwLock;
+use std::sync::RwLock;
 
 #[allow(clippy::module_inception)]
 mod btree;
@@ -172,13 +172,13 @@ impl BTreeTable {
 		address: Address,
 		log: &impl LogQuery,
 	) -> Result<Option<(u8, Value)>> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		let btree = self.locked(&tables);
 		Column::get_value(key, address, btree, log)
 	}
 
 	pub fn flush(&self) -> Result<()> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		for t in tables.iter() {
 			t.flush()?;
 		}
@@ -216,13 +216,13 @@ impl BTreeTable {
 	}
 
 	pub fn with_locked<R>(&self, mut apply: impl FnMut(TablesRef) -> Result<R>) -> Result<R> {
-		let locked_tables = &*self.tables.read();
+		let locked_tables = &*self.tables.read().unwrap();
 		let locked = self.locked(locked_tables);
 		apply(locked)
 	}
 
 	pub fn enact_plan(&self, action: LogAction, log: &mut LogReader) -> Result<()> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		match action {
 			LogAction::InsertValue(record) => {
 				tables[record.table.size_tier() as usize].enact_plan(record.index, log)?;
@@ -233,7 +233,7 @@ impl BTreeTable {
 	}
 
 	pub fn validate_plan(&self, action: LogAction, log: &mut LogReader) -> Result<()> {
-		let tables = self.tables.upgradable_read();
+		let tables = self.tables.write().unwrap();
 		match action {
 			LogAction::InsertValue(record) => {
 				tables[record.table.size_tier() as usize].validate_plan(record.index, log)?;
@@ -247,7 +247,7 @@ impl BTreeTable {
 	}
 
 	pub fn complete_plan(&self, log: &mut LogWriter) -> Result<()> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		for t in tables.iter() {
 			t.complete_plan(log)?;
 		}
@@ -255,7 +255,7 @@ impl BTreeTable {
 	}
 
 	pub fn refresh_metadata(&self) -> Result<()> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		for t in tables.iter() {
 			t.refresh_metadata()?;
 		}
@@ -436,7 +436,7 @@ pub mod commit_overlay {
 		) -> Result<()> {
 			let record_id = writer.record_id();
 
-			let locked_tables = btree.tables.read();
+			let locked_tables = btree.tables.read().unwrap();
 			let locked = btree.locked(&locked_tables);
 			let mut tree = BTree::open(locked, writer, record_id)?;
 

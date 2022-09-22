@@ -11,7 +11,7 @@ use super::*;
 use crate::{
 	btree::BTreeTable, db::CommitOverlay, error::Result, log::LogQuery, table::key::TableKeyQuery,
 };
-use parking_lot::RwLock;
+use std::sync::RwLock;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SeekTo<'a> {
@@ -75,7 +75,7 @@ impl<'a> BTreeIterator<'a> {
 		log: &'a RwLock<crate::log::LogOverlays>,
 		commit_overlay: &'a RwLock<Vec<CommitOverlay>>,
 	) -> Result<Self> {
-		let record_id = log.read().last_record_id(col);
+		let record_id = log.read().unwrap().last_record_id(col);
 		let tree = table.with_locked(|btree| BTree::open(btree, log, record_id))?;
 		let iter = BTreeIterState::new(tree.record_id);
 		Ok(BTreeIterator {
@@ -91,7 +91,7 @@ impl<'a> BTreeIterator<'a> {
 
 	pub fn seek(&mut self, key: &[u8]) -> Result<()> {
 		// seek require log do not change
-		let log = self.log.read();
+		let log = self.log.read().unwrap();
 		let record_id = log.last_record_id(self.col);
 		self.last_key = LastKey::Seeked(key.to_vec());
 		self.pending_backend = None;
@@ -103,7 +103,7 @@ impl<'a> BTreeIterator<'a> {
 	}
 
 	pub fn seek_to_last(&mut self) -> Result<()> {
-		let log = self.log.read();
+		let log = self.log.read().unwrap();
 		let record_id = log.last_record_id(self.col);
 		self.last_key = LastKey::End;
 		self.seek_backend_to_last(record_id, self.table, &*log)
@@ -123,13 +123,13 @@ impl<'a> BTreeIterator<'a> {
 
 		loop {
 			// Lock log over function call (no btree struct change).
-			let commit_overlay = self.commit_overlay.read();
+			let commit_overlay = self.commit_overlay.read().unwrap();
 			let next_commit_overlay =
 				commit_overlay.get(col as usize).and_then(|o| match direction {
 					IterDirection::Forward => o.btree_next(&self.last_key),
 					IterDirection::Backward => o.btree_prev(&self.last_key),
 				});
-			let log = self.log.read();
+			let log = self.log.read().unwrap();
 			let record_id = log.last_record_id(self.col);
 			// No consistency over iteration, allows dropping lock to overlay.
 			drop(commit_overlay);

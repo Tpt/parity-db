@@ -30,13 +30,12 @@ use crate::{
 	Key,
 };
 use fs2::FileExt;
-use parking_lot::{Condvar, Mutex, RwLock};
 use std::{
 	collections::{BTreeMap, HashMap, VecDeque},
 	ops::Bound,
 	sync::{
 		atomic::{AtomicBool, AtomicU64, Ordering},
-		Arc,
+		Arc, Condvar, Mutex, RwLock,
 	},
 };
 // Max size of commit queue. (Keys + Values). If the queue is
@@ -109,21 +108,21 @@ struct WaitCondvar<S> {
 
 impl<S: Default> WaitCondvar<S> {
 	fn new() -> Self {
-		WaitCondvar { cv: Condvar::new(), work: Mutex::new(S::default()) }
+		WaitCondvar { cv: Condvar::new(), work: Mutex::default() }
 	}
 }
 
 impl WaitCondvar<bool> {
 	fn signal(&self) {
-		let mut work = self.work.lock();
+		let mut work = self.work.lock().unwrap();
 		*work = true;
 		self.cv.notify_one();
 	}
 
 	pub fn wait(&self) {
-		let mut work = self.work.lock();
+		let mut work = self.work.lock().unwrap();
 		while !*work {
-			self.cv.wait(&mut work)
+			work = self.cv.wait(work).unwrap();
 		}
 		*work = false;
 	}
@@ -169,7 +168,7 @@ impl DbInner {
 			options,
 			shutdown: AtomicBool::new(false),
 			log,
-			commit_queue: Mutex::new(Default::default()),
+			commit_queue: Mutex::default(),
 			commit_queue_full_cv: Condvar::new(),
 			log_worker_wait: WaitCondvar::new(),
 			commit_worker_wait: Arc::new(WaitCondvar::new()),
@@ -189,7 +188,7 @@ impl DbInner {
 		match &self.columns[col as usize] {
 			Column::Hash(column) => {
 				let key = column.hash_key(key);
-				let overlay = self.commit_overlay.read();
+				let overlay = self.commit_overlay.read().unwrap();
 				// Check commit overlay first
 				if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key)) {
 					return Ok(v)
@@ -199,12 +198,12 @@ impl DbInner {
 				column.get(&key, log)
 			},
 			Column::Tree(column) => {
-				let overlay = self.commit_overlay.read();
+				let overlay = self.commit_overlay.read().unwrap();
 				if let Some(l) = overlay.get(col as usize).and_then(|o| o.btree_get(key)) {
 					return Ok(l.cloned())
 				}
 				// We lock log, if btree structure changed while reading that would be an issue.
-				let log = self.log.overlays().read();
+				let log = self.log.overlays().read().unwrap();
 				column.with_locked(|btree| BTreeTable::get(key, &*log, btree))
 			},
 		}
@@ -214,7 +213,7 @@ impl DbInner {
 		match &self.columns[col as usize] {
 			Column::Hash(column) => {
 				let key = column.hash_key(key);
-				let overlay = self.commit_overlay.read();
+				let overlay = self.commit_overlay.read().unwrap();
 				// Check commit overlay first
 				if let Some(l) = overlay.get(col as usize).and_then(|o| o.get_size(&key)) {
 					return Ok(l)
@@ -224,11 +223,11 @@ impl DbInner {
 				column.get_size(&key, log)
 			},
 			Column::Tree(column) => {
-				let overlay = self.commit_overlay.read();
+				let overlay = self.commit_overlay.read().unwrap();
 				if let Some(l) = overlay.get(col as usize).and_then(|o| o.btree_get(key)) {
 					return Ok(l.map(|v| v.len() as u32))
 				}
-				let log = self.log.overlays().read();
+				let log = self.log.overlays().read().unwrap();
 				let l = column.with_locked(|btree| BTreeTable::get(key, &*log, btree))?;
 				Ok(l.map(|v| v.len() as u32))
 			},
@@ -289,19 +288,19 @@ impl DbInner {
 	}
 
 	fn commit_raw(&self, commit: CommitChangeSet) -> Result<()> {
-		let mut queue = self.commit_queue.lock();
+		let mut queue = self.commit_queue.lock().unwrap();
 		if queue.bytes > MAX_COMMIT_QUEUE_BYTES {
 			log::debug!(target: "parity-db", "Waiting, queue size={}", queue.bytes);
-			self.commit_queue_full_cv.wait(&mut queue);
+			queue = self.commit_queue_full_cv.wait(queue).unwrap();
 		}
 		{
-			let bg_err = self.bg_err.lock();
+			let bg_err = self.bg_err.lock().unwrap();
 			if let Some(err) = &*bg_err {
 				return Err(Error::Background(err.clone()))
 			}
 		}
 
-		let mut overlay = self.commit_overlay.write();
+		let mut overlay = self.commit_overlay.write().unwrap();
 
 		queue.record_id += 1;
 		let record_id = queue.record_id + 1;
@@ -342,14 +341,14 @@ impl DbInner {
 	fn process_commits(&self) -> Result<bool> {
 		{
 			// Wait if the queue is full.
-			let mut queue = self.log_queue_wait.work.lock();
+			let queue = self.log_queue_wait.work.lock().unwrap();
 			if !self.shutdown.load(Ordering::Relaxed) && *queue > MAX_LOG_QUEUE_BYTES {
 				log::debug!(target: "parity-db", "Waiting, log_bytes={}", queue);
-				self.log_queue_wait.cv.wait(&mut queue);
+				drop(self.log_queue_wait.cv.wait(queue).unwrap());
 			}
 		}
 		let commit = {
-			let mut queue = self.commit_queue.lock();
+			let mut queue = self.commit_queue.lock().unwrap();
 			if let Some(commit) = queue.commits.pop_front() {
 				queue.bytes -= commit.bytes;
 				log::debug!(
@@ -415,7 +414,7 @@ impl DbInner {
 
 			let bytes = {
 				let bytes = self.log.end_record(l)?;
-				let mut logged_bytes = self.log_queue_wait.work.lock();
+				let mut logged_bytes = self.log_queue_wait.work.lock().unwrap();
 				*logged_bytes += bytes as i64;
 				self.flush_worker_wait.signal();
 				bytes
@@ -423,7 +422,7 @@ impl DbInner {
 
 			{
 				// Cleanup the commit overlay.
-				let mut overlay = self.commit_overlay.write();
+				let mut overlay = self.commit_overlay.write().unwrap();
 				for (c, key_values) in commit.changeset.indexed.iter() {
 					key_values.clean_overlay(&mut overlay[*c as usize], commit.id);
 				}
@@ -484,7 +483,7 @@ impl DbInner {
 				let record_id = writer.record_id();
 				let l = writer.drain();
 
-				let mut logged_bytes = self.log_queue_wait.work.lock();
+				let mut logged_bytes = self.log_queue_wait.work.lock().unwrap();
 				let bytes = self.log.end_record(l)?;
 				log::debug!(
 					target: "parity-db",
@@ -631,7 +630,7 @@ impl DbInner {
 			self.log.end_read(cleared, record_id);
 			{
 				if !validation_mode {
-					let mut queue = self.log_queue_wait.work.lock();
+					let mut queue = self.log_queue_wait.work.lock().unwrap();
 					if *queue < bytes as i64 {
 						log::warn!(
 							target: "parity-db",
@@ -716,7 +715,7 @@ impl DbInner {
 
 	fn kill_logs(&self) -> Result<()> {
 		{
-			if let Some(err) = self.bg_err.lock().as_ref() {
+			if let Some(err) = self.bg_err.lock().unwrap().as_ref() {
 				// On error the log reader may be left in inconsistent state. So it is important
 				// to no attempt any further log enactment.
 				log::debug!(target: "parity-db", "Shutdown with error state {}", err);
@@ -778,7 +777,7 @@ impl DbInner {
 	fn store_err(&self, result: Result<()>) {
 		if let Err(e) = result {
 			log::warn!(target: "parity-db", "Background worker error: {}", e);
-			let mut err = self.bg_err.lock();
+			let mut err = self.bg_err.lock().unwrap();
 			if err.is_none() {
 				*err = Some(Arc::new(e));
 				self.shutdown();
@@ -1390,7 +1389,7 @@ impl EnableCommitPipelineStages {
 	fn check_empty_overlay(&self, db: &DbInner, col: ColId) -> bool {
 		match self {
 			EnableCommitPipelineStages::DbFile | EnableCommitPipelineStages::LogOverlay => {
-				if let Some(overlay) = db.commit_overlay.read().get(col as usize) {
+				if let Some(overlay) = db.commit_overlay.read().unwrap().get(col as usize) {
 					if !overlay.is_empty() {
 						let mut replayed = 5;
 						while !overlay.is_empty() {

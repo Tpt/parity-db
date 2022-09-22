@@ -20,7 +20,6 @@ libc = "0.2"
 log = "0.4.8"
 lz4 = "1.24.0"
 memmap2 = "0.5"
-parking_lot = "0.12.0"
 rand = "0.8.4"
 snap = "1"
 

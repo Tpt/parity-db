@@ -58,7 +58,7 @@ use std::{
 	mem::MaybeUninit,
 	sync::{
 		atomic::{AtomicBool, AtomicU64, Ordering},
-		Arc,
+		Arc, RwLock,
 	},
 };
 
@@ -354,7 +354,7 @@ impl ValueTable {
 		let file = crate::file::TableFile::open(filepath, entry_size, id)?;
 		let mut filled = 1;
 		let mut last_removed = 0;
-		if let Some(file) = &mut *file.file.write() {
+		if let Some(file) = &mut *file.file.write().unwrap() {
 			let mut header = Header::default();
 			try_io!(file.read_exact(&mut header.0));
 			last_removed = header.last_removed();
@@ -892,7 +892,7 @@ impl ValueTable {
 	}
 
 	pub fn refresh_metadata(&self) -> Result<()> {
-		if self.file.file.read().is_none() {
+		if self.file.file.read().unwrap().is_none() {
 			return Ok(())
 		}
 		let mut header = Header::default();
@@ -966,7 +966,7 @@ impl ValueTable {
 	}
 
 	pub fn is_init(&self) -> bool {
-		self.file.file.read().is_some()
+		self.file.file.read().unwrap().is_some()
 	}
 
 	pub fn init_with_entry(&self, entry: &[u8]) -> Result<()> {
@@ -981,7 +981,7 @@ impl ValueTable {
 	fn do_init_with_entry(&self, entry: &[u8]) -> Result<()> {
 		self.file.grow(self.entry_size)?;
 
-		let empty_overlays = parking_lot::RwLock::new(Default::default());
+		let empty_overlays = RwLock::default();
 		let mut log = LogWriter::new(&empty_overlays, 0);
 		let at = self.overwrite_chain(&TableKey::NoHash, entry, &mut log, None, false)?;
 		self.complete_plan(&mut log)?;

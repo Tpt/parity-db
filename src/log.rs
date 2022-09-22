@@ -8,12 +8,15 @@ use crate::{
 	options::Options,
 	table::TableId as ValueTableId,
 };
-use parking_lot::{Condvar, MappedRwLockWriteGuard, Mutex, RwLock, RwLockWriteGuard};
 use std::{
 	collections::{HashMap, VecDeque},
 	convert::TryInto,
-	io::{ErrorKind, Read, Seek, Write},
-	sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+	fs::File,
+	io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
+	sync::{
+		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+		Condvar, Mutex, RwLock, RwLockWriteGuard,
+	},
 };
 
 const MAX_LOG_POOL_SIZE: usize = 16;
@@ -74,11 +77,11 @@ impl LogQuery for RwLock<LogOverlays> {
 		index: u64,
 		f: F,
 	) -> Option<R> {
-		self.read().with_index(table, index, f)
+		self.read().unwrap().with_index(table, index, f)
 	}
 
 	fn value(&self, table: ValueTableId, index: u64, dest: &mut [u8]) -> bool {
-		self.read().value(table, index, dest)
+		self.read().unwrap().value(table, index, dest)
 	}
 }
 
@@ -115,7 +118,7 @@ pub struct Cleared {
 
 #[derive(Debug)]
 pub struct LogReader<'a> {
-	file: MappedRwLockWriteGuard<'a, std::io::BufReader<std::fs::File>>,
+	reading: RwLockWriteGuard<'a, Option<Reading>>,
 	record_id: u64,
 	read_bytes: u64,
 	crc32: crc32fast::Hasher,
@@ -128,13 +131,10 @@ impl<'a> LogReader<'a> {
 		self.record_id
 	}
 
-	fn new(
-		file: MappedRwLockWriteGuard<'a, std::io::BufReader<std::fs::File>>,
-		validate: bool,
-	) -> LogReader<'a> {
+	fn new(reading: RwLockWriteGuard<'a, Option<Reading>>, validate: bool) -> LogReader<'a> {
 		LogReader {
 			cleared: Default::default(),
-			file,
+			reading,
 			record_id: 0,
 			read_bytes: 0,
 			crc32: crc32fast::Hasher::new(),
@@ -144,7 +144,8 @@ impl<'a> LogReader<'a> {
 
 	pub fn reset(&mut self) -> Result<()> {
 		self.cleared = Default::default();
-		try_io!(self.file.seek(std::io::SeekFrom::Current(-(self.read_bytes as i64))));
+		let seek_from = -(self.read_bytes as i64);
+		try_io!(self.file().seek(SeekFrom::Current(seek_from)));
 		self.read_bytes = 0;
 		self.record_id = 0;
 		self.crc32 = crc32fast::Hasher::new();
@@ -153,7 +154,7 @@ impl<'a> LogReader<'a> {
 
 	pub fn next(&mut self) -> Result<LogAction> {
 		let mut read_buf = |size, buf: &mut [u8; 8]| -> Result<()> {
-			try_io!(self.file.read_exact(&mut buf[0..size]));
+			try_io!(self.file().read_exact(&mut buf[0..size]));
 			self.read_bytes += size as u64;
 			if self.validate {
 				self.crc32.update(&buf[0..size]);
@@ -189,7 +190,7 @@ impl<'a> LogReader<'a> {
 				Ok(LogAction::InsertValue(InsertValueAction { table, index }))
 			},
 			END_RECORD => {
-				try_io!(self.file.read_exact(&mut buf[0..4]));
+				try_io!(self.file().read_exact(&mut buf[0..4]));
 				self.read_bytes += 4;
 				if self.validate {
 					let checksum = u32::from_le_bytes(buf[0..4].try_into().unwrap());
@@ -218,7 +219,7 @@ impl<'a> LogReader<'a> {
 	}
 
 	pub fn read(&mut self, buf: &mut [u8]) -> Result<()> {
-		try_io!(self.file.read_exact(buf));
+		try_io!(self.file().read_exact(buf));
 		self.read_bytes += buf.len() as u64;
 		if self.validate {
 			self.crc32.update(buf);
@@ -232,6 +233,10 @@ impl<'a> LogReader<'a> {
 
 	pub fn read_bytes(&self) -> u64 {
 		self.read_bytes
+	}
+
+	fn file(&mut self) -> &mut BufReader<File> {
+		&mut self.reading.as_mut().unwrap().file
 	}
 }
 
@@ -532,8 +537,8 @@ impl Log {
 			dirty: AtomicBool::new(true),
 			sync: options.sync_wal,
 			replay_queue: RwLock::new(logs),
-			cleanup_queue: RwLock::new(Default::default()),
-			log_pool: RwLock::new(Default::default()),
+			cleanup_queue: RwLock::default(),
+			log_pool: RwLock::default(),
 			path,
 		})
 	}
@@ -545,7 +550,7 @@ impl Log {
 	}
 
 	pub fn replay_record_id(&self) -> Option<u64> {
-		self.replay_queue.read().front().map(|(_id, record_id, _)| *record_id)
+		self.replay_queue.read().unwrap().front().map(|(_id, record_id, _)| *record_id)
 	}
 
 	pub fn open_log_file(path: &std::path::Path) -> Result<(std::fs::File, Option<u64>)> {
@@ -582,7 +587,7 @@ impl Log {
 
 	pub fn clear_replay_logs(&self) -> Result<()> {
 		{
-			let mut reading = self.reading.write();
+			let mut reading = self.reading.write().unwrap();
 			let id = reading.as_ref().map(|r| r.id);
 			*reading = None;
 			if let Some(id) = id {
@@ -590,17 +595,17 @@ impl Log {
 			}
 		}
 		{
-			let replay_logs = std::mem::take(&mut *self.replay_queue.write());
+			let replay_logs = std::mem::take(&mut *self.replay_queue.write().unwrap());
 			for (id, _, file) in replay_logs {
 				drop(file);
 				self.drop_log(id)?;
 			}
 		}
-		let mut overlays = self.overlays.write();
+		let mut overlays = self.overlays.write().unwrap();
 		overlays.index.clear();
 		overlays.value.clear();
 		overlays.last_record_id.clear();
-		*self.reading_state.lock() = ReadingState::Idle;
+		*self.reading_state.lock().unwrap() = ReadingState::Idle;
 		self.dirty.store(false, Ordering::Relaxed);
 		Ok(())
 	}
@@ -613,10 +618,10 @@ impl Log {
 	pub fn end_record(&self, log: LogChange) -> Result<u64> {
 		assert_eq!(log.record_id + 1, self.next_record_id.load(Ordering::Relaxed));
 		let record_id = log.record_id;
-		let mut appending = self.appending.write();
+		let mut appending = self.appending.write().unwrap();
 		if appending.is_none() {
 			// Find a log file in the pool or create a new one
-			let (id, file) = if let Some((id, file)) = self.log_pool.write().pop_front() {
+			let (id, file) = if let Some((id, file)) = self.log_pool.write().unwrap().pop_front() {
 				log::debug!(target: "parity-db", "Flush: Activated pool writer {}", id);
 				(id, file)
 			} else {
@@ -635,7 +640,7 @@ impl Log {
 		}
 		let appending = appending.as_mut().unwrap();
 		let FlushedLog { index, values, bytes } = log.flush_to_file(&mut appending.file)?;
-		let mut overlays = self.overlays.write();
+		let mut overlays = self.overlays.write().unwrap();
 		let mut total_index = 0;
 		for (id, overlay) in index.into_iter() {
 			total_index += overlay.map.len();
@@ -664,7 +669,7 @@ impl Log {
 		if record_id >= self.next_record_id.load(Ordering::Relaxed) {
 			self.next_record_id.store(record_id + 1, Ordering::Relaxed);
 		}
-		let mut overlays = self.overlays.write();
+		let mut overlays = self.overlays.write().unwrap();
 		for (table, index) in cleared.index.into_iter() {
 			if let Some(ref mut overlay) = overlays.index.get_mut(&table) {
 				if let std::collections::hash_map::Entry::Occupied(e) = overlay.map.entry(index) {
@@ -689,23 +694,23 @@ impl Log {
 
 	pub fn flush_one(&self, min_size: u64) -> Result<(bool, bool, bool)> {
 		// Wait for the reader to finish reading
-		let mut flushing = self.flushing.lock();
+		let mut flushing = self.flushing.lock().unwrap();
 		let mut read_next = false;
 		let mut cleanup = false;
 		if flushing.is_some() {
-			let mut reading_state = self.reading_state.lock();
+			let mut reading_state = self.reading_state.lock().unwrap();
 
 			while *reading_state == ReadingState::Reading {
 				log::debug!(target: "parity-db", "Flush: Awaiting log reader");
-				self.done_reading_cv.wait(&mut reading_state)
+				reading_state = self.done_reading_cv.wait(reading_state).unwrap();
 			}
 
 			{
-				let mut reading = self.reading.write();
+				let mut reading = self.reading.write().unwrap();
 				if let Some(reading) = reading.take() {
 					log::debug!(target: "parity-db", "Flush: Activated log cleanup {}", reading.id);
 					let file = reading.file.into_inner();
-					self.cleanup_queue.write().push_back((reading.id, file));
+					self.cleanup_queue.write().unwrap().push_back((reading.id, file));
 					*reading_state = ReadingState::Idle;
 					cleanup = true;
 				}
@@ -725,9 +730,9 @@ impl Log {
 
 		{
 			// Lock writer and reset it
-			let cur_size = self.appending.read().as_ref().map_or(0, |r| r.size);
+			let cur_size = self.appending.read().unwrap().as_ref().map_or(0, |r| r.size);
 			if cur_size > 0 && cur_size > min_size {
-				let mut appending = self.appending.write();
+				let mut appending = self.appending.write().unwrap();
 				let to_flush = appending.take();
 				*flushing = to_flush.map(|to_flush| Flushing {
 					file: to_flush.file.into_inner().unwrap(),
@@ -749,34 +754,34 @@ impl Log {
 	}
 
 	pub fn replay_next(&mut self) -> Result<Option<u32>> {
-		let mut reading = self.reading.write();
+		let mut reading = self.reading.write().unwrap();
 		{
 			if let Some(reading) = reading.take() {
 				log::debug!(target: "parity-db", "Replay: Activated log cleanup {}", reading.id);
 				let file = reading.file.into_inner();
-				self.cleanup_queue.write().push_back((reading.id, file));
+				self.cleanup_queue.write().unwrap().push_back((reading.id, file));
 			}
 		}
-		if let Some((id, _record_id, file)) = self.replay_queue.write().pop_front() {
+		if let Some((id, _record_id, file)) = self.replay_queue.write().unwrap().pop_front() {
 			log::debug!(target: "parity-db", "Replay: Activated log reader {}", id);
 			*reading = Some(Reading { id, file: std::io::BufReader::new(file) });
-			*self.reading_state.lock() = ReadingState::Reading;
+			*self.reading_state.lock().unwrap() = ReadingState::Reading;
 			Ok(Some(id))
 		} else {
-			*self.reading_state.lock() = ReadingState::Idle;
+			*self.reading_state.lock().unwrap() = ReadingState::Idle;
 			Ok(None)
 		}
 	}
 
 	pub fn clean_logs(&self, count: usize) -> Result<bool> {
-		let mut cleaned: Vec<_> = { self.cleanup_queue.write().drain(0..count).collect() };
+		let mut cleaned: Vec<_> = { self.cleanup_queue.write().unwrap().drain(0..count).collect() };
 		for (id, ref mut file) in cleaned.iter_mut() {
 			log::debug!(target: "parity-db", "Cleaned: {}", id);
 			try_io!(file.seek(std::io::SeekFrom::Start(0)));
 			try_io!(file.set_len(0));
 		}
 		// Move cleaned logs back to the pool
-		let mut pool = self.log_pool.write();
+		let mut pool = self.log_pool.write().unwrap();
 		pool.extend(cleaned);
 		// Sort to reuse lower IDs an prevent IDs from growing.
 		pool.make_contiguous().sort_by_key(|(id, _)| *id);
@@ -787,26 +792,25 @@ impl Log {
 				self.drop_log(id)?;
 			}
 		}
-		Ok(!self.cleanup_queue.read().is_empty())
+		Ok(!self.cleanup_queue.read().unwrap().is_empty())
 	}
 
 	pub fn num_dirty_logs(&self) -> usize {
-		self.cleanup_queue.read().len()
+		self.cleanup_queue.read().unwrap().len()
 	}
 
 	pub fn read_next(&self, validate: bool) -> Result<Option<LogReader<'_>>> {
-		let mut reading_state = self.reading_state.lock();
+		let mut reading_state = self.reading_state.lock().unwrap();
 		if *reading_state != ReadingState::Reading {
 			log::trace!(target: "parity-db", "No logs to enact");
 			return Ok(None)
 		}
 
-		let reading = self.reading.write();
+		let reading = self.reading.write().unwrap();
 		if reading.is_none() {
 			log::trace!(target: "parity-db", "No active reader");
 			return Ok(None)
 		}
-		let reading = RwLockWriteGuard::map(reading, |r| &mut r.as_mut().unwrap().file);
 		let mut reader = LogReader::new(reading, validate);
 		match reader.next() {
 			Ok(LogAction::BeginRecord) => Ok(Some(reader)),
@@ -826,12 +830,12 @@ impl Log {
 	}
 
 	pub fn kill_logs(&self) -> Result<()> {
-		let mut log_pool = self.log_pool.write();
+		let mut log_pool = self.log_pool.write().unwrap();
 		for (id, file) in log_pool.drain(..) {
 			drop(file);
 			self.drop_log(id)?;
 		}
-		if let Some(reading) = self.reading.write().take() {
+		if let Some(reading) = self.reading.write().unwrap().take() {
 			drop(reading.file);
 			self.drop_log(reading.id)?;
 		}

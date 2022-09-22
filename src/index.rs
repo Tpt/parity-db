@@ -10,8 +10,7 @@ use crate::{
 	table::{key::TableKey, SIZE_TIERS_BITS},
 	Key,
 };
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use std::convert::TryInto;
+use std::{convert::TryInto, sync::RwLock};
 
 // Index chunk consists of 8 64-bit entries.
 const CHUNK_LEN: usize = CHUNK_ENTRIES * ENTRY_BYTES; // 512 bytes
@@ -209,7 +208,7 @@ impl IndexTable {
 	}
 
 	pub fn load_stats(&self) -> Result<ColumnStats> {
-		if let Some(map) = &*self.map.read() {
+		if let Some(map) = &*self.map.read().unwrap() {
 			Ok(ColumnStats::from_slice(try_io!(Ok(
 				&map[HEADER_SIZE..HEADER_SIZE + stats::TOTAL_SIZE]
 			))))
@@ -219,7 +218,7 @@ impl IndexTable {
 	}
 
 	pub fn write_stats(&self, stats: &ColumnStats) -> Result<()> {
-		if let Some(map) = &mut *self.map.write() {
+		if let Some(map) = &mut *self.map.write().unwrap() {
 			let slice = try_io!(Ok(&mut map[HEADER_SIZE..HEADER_SIZE + stats::TOTAL_SIZE]));
 			stats.to_slice(slice);
 		}
@@ -266,7 +265,7 @@ impl IndexTable {
 			return Ok(entry)
 		}
 
-		if let Some(map) = &*self.map.read() {
+		if let Some(map) = &*self.map.read().unwrap() {
 			log::trace!(target: "parity-db", "{}: Querying chunk at {}", self.id, chunk_index);
 			let chunk = Self::chunk_at(chunk_index, map)?;
 			return Ok(self.find_entry(key, sub_index, chunk))
@@ -281,7 +280,7 @@ impl IndexTable {
 		{
 			return Ok(entry)
 		}
-		if let Some(map) = &*self.map.read() {
+		if let Some(map) = &*self.map.read().unwrap() {
 			let source = Self::chunk_at(chunk_index, map)?;
 			chunk.copy_from_slice(source);
 			return Ok(Self::transmute_chunk(chunk))
@@ -372,7 +371,7 @@ impl IndexTable {
 			return self.plan_insert_chunk(key_prefix, address, &chunk, sub_index, log)
 		}
 
-		if let Some(map) = &*self.map.read() {
+		if let Some(map) = &*self.map.read().unwrap() {
 			let chunk = Self::chunk_at(chunk_index, map)?;
 			return self.plan_insert_chunk(key_prefix, address, chunk, sub_index, log)
 		}
@@ -420,7 +419,7 @@ impl IndexTable {
 			return self.plan_remove_chunk(key_prefix, &chunk, sub_index, log)
 		}
 
-		if let Some(map) = &*self.map.read() {
+		if let Some(map) = &*self.map.read().unwrap() {
 			let chunk = Self::chunk_at(chunk_index, map)?;
 			return self.plan_remove_chunk(key_prefix, chunk, sub_index, log)
 		}
@@ -429,21 +428,26 @@ impl IndexTable {
 	}
 
 	pub fn enact_plan(&self, index: u64, log: &mut LogReader) -> Result<()> {
-		let mut map = self.map.upgradable_read();
+		let mut map = self.map.read().unwrap();
 		if map.is_none() {
-			let mut wmap = RwLockUpgradableReadGuard::upgrade(map);
-			let file = try_io!(std::fs::OpenOptions::new()
-				.write(true)
-				.read(true)
-				.create_new(true)
-				.open(self.path.as_path()));
-			log::debug!(target: "parity-db", "Created new index {}", self.id);
-			//TODO: check for potential overflows on 32-bit platforms
-			try_io!(file.set_len(file_size(self.id.index_bits())));
-			let mut mmap = try_io!(unsafe { memmap2::MmapMut::map_mut(&file) });
-			self.madvise_random(&mut mmap);
-			*wmap = Some(mmap);
-			map = parking_lot::RwLockWriteGuard::downgrade_to_upgradable(wmap);
+			drop(map);
+			{
+				let mut wmap = self.map.write().unwrap();
+				if wmap.is_none() {
+					let file = try_io!(std::fs::OpenOptions::new()
+						.write(true)
+						.read(true)
+						.create_new(true)
+						.open(self.path.as_path()));
+					log::debug!(target: "parity-db", "Created new index {}", self.id);
+					//TODO: check for potential overflows on 32-bit platforms
+					try_io!(file.set_len(file_size(self.id.index_bits())));
+					let mut mmap = try_io!(unsafe { memmap2::MmapMut::map_mut(&file) });
+					self.madvise_random(&mut mmap);
+					*wmap = Some(mmap);
+				}
+			}
+			map = self.map.read().unwrap();
 		}
 
 		let map = map.as_ref().unwrap();
@@ -505,7 +509,7 @@ impl IndexTable {
 	}
 
 	pub fn flush(&self) -> Result<()> {
-		if let Some(map) = &*self.map.read() {
+		if let Some(map) = &*self.map.read().unwrap() {
 			// Flush everything except stats.
 			try_io!(map.flush_range(META_SIZE, map.len() - META_SIZE));
 		}

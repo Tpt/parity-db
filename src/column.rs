@@ -17,10 +17,12 @@ use crate::{
 	},
 	Key,
 };
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use std::{
 	collections::VecDeque,
-	sync::atomic::{AtomicU64, Ordering},
+	sync::{
+		atomic::{AtomicU64, Ordering},
+		RwLock, RwLockReadGuard,
+	},
 };
 
 const MIN_INDEX_BITS: u8 = 16;
@@ -158,7 +160,7 @@ pub struct ReindexBatch {
 
 impl HashColumn {
 	pub fn get(&self, key: &Key, log: &impl LogQuery) -> Result<Option<Value>> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		let values = self.as_ref(&tables.value);
 		if let Some((tier, value)) = self.get_in_index(key, &tables.index, values, log)? {
 			if self.collect_stats {
@@ -166,7 +168,7 @@ impl HashColumn {
 			}
 			return Ok(Some(value))
 		}
-		for r in &self.reindex.read().queue {
+		for r in &self.reindex.read().unwrap().queue {
 			if let Some((tier, value)) = self.get_in_index(key, r, values, log)? {
 				if self.collect_stats {
 					self.stats.query_hit(tier);
@@ -339,7 +341,7 @@ impl HashColumn {
 	}
 
 	pub fn flush(&self) -> Result<()> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		tables.index.flush()?;
 		for t in tables.value.iter() {
 			t.flush()?;
@@ -372,13 +374,11 @@ impl HashColumn {
 		Ok((table, reindexing, stats))
 	}
 
-	fn trigger_reindex<'a, 'b>(
-		tables: RwLockUpgradableReadGuard<'a, Tables>,
-		reindex: RwLockUpgradableReadGuard<'b, Reindex>,
-		path: &std::path::Path,
-	) -> (RwLockUpgradableReadGuard<'a, Tables>, RwLockUpgradableReadGuard<'b, Reindex>) {
-		let mut tables = RwLockUpgradableReadGuard::upgrade(tables);
-		let mut reindex = RwLockUpgradableReadGuard::upgrade(reindex);
+	fn trigger_reindex(&self, tables: RwLockReadGuard<Tables>, reindex: RwLockReadGuard<Reindex>) {
+		drop(tables);
+		drop(reindex);
+		let mut tables = self.tables.write().unwrap();
+		let mut reindex = self.reindex.write().unwrap();
 		log::info!(
 			target: "parity-db",
 			"Started reindex for {}",
@@ -387,13 +387,9 @@ impl HashColumn {
 		// Start reindex
 		let new_index_id =
 			IndexTableId::new(tables.index.id.col(), tables.index.id.index_bits() + 1);
-		let new_table = IndexTable::create_new(path, new_index_id);
+		let new_table = IndexTable::create_new(self.path.as_path(), new_index_id);
 		let old_table = std::mem::replace(&mut tables.index, new_table);
 		reindex.queue.push_back(old_table);
-		(
-			parking_lot::RwLockWriteGuard::downgrade_to_upgradable(tables),
-			parking_lot::RwLockWriteGuard::downgrade_to_upgradable(reindex),
-		)
 	}
 
 	pub fn write_reindex_plan(
@@ -402,27 +398,16 @@ impl HashColumn {
 		address: Address,
 		log: &mut LogWriter,
 	) -> Result<PlanOutcome> {
-		let tables = self.tables.upgradable_read();
-		let reindex = self.reindex.upgradable_read();
-		self.write_reindex_plan_locked(tables, reindex, key, address, log)
-	}
-
-	fn write_reindex_plan_locked<'a, 'b>(
-		&self,
-		tables: RwLockUpgradableReadGuard<'a, Tables>,
-		reindex: RwLockUpgradableReadGuard<'b, Reindex>,
-		key: &Key,
-		address: Address,
-		log: &mut LogWriter,
-	) -> Result<PlanOutcome> {
+		let tables = self.tables.read().unwrap();
+		let reindex = self.reindex.read().unwrap();
 		if Self::search_index(key, &tables.index, &tables, log)?.is_some() {
 			return Ok(PlanOutcome::Skipped)
 		}
 		match tables.index.write_insert_plan(key, address, None, log)? {
 			PlanOutcome::NeedReindex => {
 				log::debug!(target: "parity-db", "{}: Index chunk full {} when reindexing", tables.index.id, hex(key));
-				let (tables, reindex) = Self::trigger_reindex(tables, reindex, self.path.as_path());
-				self.write_reindex_plan_locked(tables, reindex, key, address, log)?;
+				self.trigger_reindex(tables, reindex);
+				self.write_reindex_plan(key, address, log)?;
 				Ok(PlanOutcome::NeedReindex)
 			},
 			_ => Ok(PlanOutcome::Written),
@@ -479,8 +464,8 @@ impl HashColumn {
 		change: &Operation<Key, Vec<u8>>,
 		log: &mut LogWriter,
 	) -> Result<PlanOutcome> {
-		let tables = self.tables.upgradable_read();
-		let reindex = self.reindex.upgradable_read();
+		let tables = self.tables.read().unwrap();
+		let reindex = self.reindex.read().unwrap();
 		let existing = Self::search_all_indexes(change.key(), &tables, &reindex, log)?;
 		if let Some((table, sub_index, existing_address)) = existing {
 			self.write_plan_existing(&tables, change, log, table, sub_index, existing_address)
@@ -546,18 +531,14 @@ impl HashColumn {
 		}
 	}
 
-	fn write_plan_new<'a, 'b>(
-		&self,
-		tables: RwLockUpgradableReadGuard<'a, Tables>,
-		reindex: RwLockUpgradableReadGuard<'b, Reindex>,
+	fn write_plan_new<'a>(
+		&'a self,
+		tables: RwLockReadGuard<'a, Tables>,
+		reindex: RwLockReadGuard<'a, Reindex>,
 		key: &Key,
 		value: &[u8],
 		log: &mut LogWriter,
-	) -> Result<(
-		PlanOutcome,
-		RwLockUpgradableReadGuard<'a, Tables>,
-		RwLockUpgradableReadGuard<'b, Reindex>,
-	)> {
+	) -> Result<(PlanOutcome, RwLockReadGuard<'a, Tables>, RwLockReadGuard<'a, Reindex>)> {
 		let stats = self.collect_stats.then_some(&self.stats);
 		let table_key = TableKey::Partial(*key);
 		let address = Column::write_new_value_plan(
@@ -570,8 +551,14 @@ impl HashColumn {
 		match tables.index.write_insert_plan(key, address, None, log)? {
 			PlanOutcome::NeedReindex => {
 				log::debug!(target: "parity-db", "{}: Index chunk full {}", tables.index.id, hex(key));
-				let (tables, reindex) = Self::trigger_reindex(tables, reindex, self.path.as_path());
-				let (_, t, r) = self.write_plan_new(tables, reindex, key, value, log)?;
+				self.trigger_reindex(tables, reindex);
+				let (_, t, r) = self.write_plan_new(
+					self.tables.read().unwrap(),
+					self.reindex.read().unwrap(),
+					key,
+					value,
+					log,
+				)?;
 				Ok((PlanOutcome::NeedReindex, t, r))
 			},
 			_ => Ok((PlanOutcome::Written, tables, reindex)),
@@ -579,8 +566,8 @@ impl HashColumn {
 	}
 
 	pub fn enact_plan(&self, action: LogAction, log: &mut LogReader) -> Result<()> {
-		let tables = self.tables.read();
-		let reindex = self.reindex.read();
+		let tables = self.tables.read().unwrap();
+		let reindex = self.reindex.read().unwrap();
 		match action {
 			LogAction::InsertIndex(record) => {
 				if tables.index.id == record.table {
@@ -611,8 +598,8 @@ impl HashColumn {
 	}
 
 	pub fn validate_plan(&self, action: LogAction, log: &mut LogReader) -> Result<()> {
-		let tables = self.tables.upgradable_read();
-		let reindex = self.reindex.upgradable_read();
+		let tables = self.tables.read().unwrap();
+		let reindex = self.reindex.read().unwrap();
 		match action {
 			LogAction::InsertIndex(record) => {
 				if tables.index.id == record.table {
@@ -627,7 +614,7 @@ impl HashColumn {
 						"Missing table {}, starting reindex",
 						record.table,
 					);
-					let _lock = Self::trigger_reindex(tables, reindex, self.path.as_path());
+					self.trigger_reindex(tables, reindex);
 					return self.validate_plan(LogAction::InsertIndex(record), log)
 				}
 			},
@@ -643,7 +630,7 @@ impl HashColumn {
 	}
 
 	pub fn complete_plan(&self, log: &mut LogWriter) -> Result<()> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		for t in tables.value.iter() {
 			t.complete_plan(log)?;
 		}
@@ -654,7 +641,7 @@ impl HashColumn {
 	}
 
 	pub fn refresh_metadata(&self) -> Result<()> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		for t in tables.value.iter() {
 			t.refresh_metadata()?;
 		}
@@ -662,7 +649,7 @@ impl HashColumn {
 	}
 
 	pub fn write_stats_text(&self, writer: &mut impl std::io::Write) -> Result<()> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		tables.index.write_stats(&self.stats)?;
 		self.stats.write_stats_text(writer, tables.index.id.col()).map_err(Error::Io)
 	}
@@ -672,7 +659,7 @@ impl HashColumn {
 	}
 
 	fn clear_stats(&self) -> Result<()> {
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		self.stats.clear();
 		tables.index.write_stats(&self.stats)
 	}
@@ -695,7 +682,7 @@ impl HashColumn {
 	) -> Result<()> {
 		use blake2::{digest::typenum::U32, Blake2b, Digest};
 
-		let tables = self.tables.read();
+		let tables = self.tables.read().unwrap();
 		let source = &tables.index;
 
 		if skip_preimage_indexes && self.preimage {
@@ -790,7 +777,7 @@ impl HashColumn {
 		let step = 1000;
 		let start_time = std::time::Instant::now();
 		log::info!(target: "parity-db", "Starting full index iteration at {:?}", start_time);
-		log::info!(target: "parity-db", "for {} chunks of column {}", self.tables.read().index.id.total_chunks(), col);
+		log::info!(target: "parity-db", "for {} chunks of column {}", self.tables.read().unwrap().index.id.total_chunks(), col);
 		self.iter_while_inner(
 			log,
 			|state| match state {
@@ -838,8 +825,8 @@ impl HashColumn {
 	}
 
 	pub fn reindex(&self, log: &Log) -> Result<ReindexBatch> {
-		let tables = self.tables.read();
-		let reindex = self.reindex.read();
+		let tables = self.tables.read().unwrap();
+		let reindex = self.reindex.read().unwrap();
 		let mut plan = Vec::new();
 		let mut drop_index = None;
 		if let Some(source) = reindex.queue.front() {
@@ -876,7 +863,7 @@ impl HashColumn {
 
 	pub fn drop_index(&self, id: IndexTableId) -> Result<()> {
 		log::debug!(target: "parity-db", "Dropping {}", id);
-		let mut reindex = self.reindex.write();
+		let mut reindex = self.reindex.write().unwrap();
 		if reindex.queue.front_mut().map_or(false, |index| index.id == id) {
 			let table = reindex.queue.pop_front();
 			reindex.progress.store(0, Ordering::Relaxed);

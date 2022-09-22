@@ -7,8 +7,10 @@ use crate::{
 	error::{try_io, Result},
 	table::TableId,
 };
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{
+	atomic::{AtomicBool, AtomicU64, Ordering},
+	RwLock,
+};
 
 #[cfg(target_os = "linux")]
 fn disable_read_ahead(file: &std::fs::File) -> std::io::Result<()> {
@@ -113,7 +115,7 @@ impl TableFile {
 	#[cfg(unix)]
 	pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
 		use std::os::unix::fs::FileExt;
-		try_io!(self.file.read().as_ref().unwrap().read_exact_at(buf, offset));
+		try_io!(self.file.read().unwrap().as_ref().unwrap().read_exact_at(buf, offset));
 		Ok(())
 	}
 
@@ -121,7 +123,7 @@ impl TableFile {
 	pub fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
 		use std::os::unix::fs::FileExt;
 		self.dirty.store(true, Ordering::Relaxed);
-		try_io!(self.file.read().as_ref().unwrap().write_all_at(buf, offset));
+		try_io!(self.file.read().unwrap().as_ref().unwrap().write_all_at(buf, offset));
 		Ok(())
 	}
 
@@ -192,11 +194,16 @@ impl TableFile {
 		capacity += GROW_SIZE_BYTES / entry_size as u64;
 
 		self.capacity.store(capacity, Ordering::Relaxed);
-		let mut file = self.file.upgradable_read();
+		let mut file = self.file.read().unwrap();
 		if file.is_none() {
-			let mut wfile = RwLockUpgradableReadGuard::upgrade(file);
-			*wfile = Some(self.create_file()?);
-			file = parking_lot::RwLockWriteGuard::downgrade_to_upgradable(wfile);
+			drop(file);
+			{
+				let mut wfile = self.file.write().unwrap();
+				if wfile.is_none() {
+					*wfile = Some(self.create_file()?);
+				}
+			}
+			file = self.file.read().unwrap();
 		}
 		try_io!(file.as_ref().unwrap().set_len(capacity * entry_size as u64));
 		Ok(())
@@ -206,7 +213,7 @@ impl TableFile {
 		if let Ok(true) =
 			self.dirty.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
 		{
-			if let Some(file) = self.file.read().as_ref() {
+			if let Some(file) = self.file.read().unwrap().as_ref() {
 				try_io!(fsync(file));
 			}
 		}
@@ -214,7 +221,7 @@ impl TableFile {
 	}
 
 	pub fn remove(&self) -> Result<()> {
-		let mut file = self.file.write();
+		let mut file = self.file.write().unwrap();
 		if let Some(file) = file.take() {
 			drop(file);
 			try_io!(std::fs::remove_file(&self.path));
